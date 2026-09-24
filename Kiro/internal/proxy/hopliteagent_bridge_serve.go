@@ -163,6 +163,14 @@ func (h *Handler) serveHopliteBridgeMessages(c *gin.Context, body []byte, model 
 			h.closeBridgeSession(sess)
 		}
 	}
+	// 会话键漂了（客户端压缩上下文/换 metadata）而这次又没带 tool_result：只剩指纹能认人。
+	// 认回来才不会给同一条 prompt 再起一条云端 thread。
+	if sess := h.recoverByFingerprint(claudeKey, fp); sess != nil {
+		bridgeAttachments.Put(sess.bridgeKey, hoplitert.ExtractAttachments(body))
+		log.Infof("proxy: /v1/messages provider=hoplite-bridge resume by fingerprint bridgeKey=%s (key drifted)", sess.bridgeKey)
+		h.bridgeNextTurn(c, sess, model, stream)
+		return
+	}
 
 	// turn-1：新任务。选 Hoplite 账号（localFs 账号，建 thread 时自动注入强提示逼走 MCP）。
 	acc, tok, err := h.pickHopliteAccount(allowed)
@@ -186,6 +194,7 @@ func (h *Handler) serveHopliteBridgeMessages(c *gin.Context, body []byte, model 
 		promptFP:  fp,
 	}
 	h.storeBridgeSession(claudeKey, sess)
+	bridgeCallIndex.putFingerprint(fp, sess) // 键漂 + 原样重发时按指纹认回这条会话
 
 	// pump：把会合的工具请求源源不断搬到 toolReqCh（会话 ctx 结束即退）。
 	go func() {

@@ -50,9 +50,10 @@ func (h *Handler) bridgeIdleTTL() time.Duration {
 type bridgeCallRegistry struct {
 	mu sync.Mutex
 	m  map[string]*bridgeSession
+	fp map[string]*bridgeSession // 请求指纹 → 会话，见 recoverByFingerprint
 }
 
-var bridgeCallIndex = &bridgeCallRegistry{m: map[string]*bridgeSession{}}
+var bridgeCallIndex = &bridgeCallRegistry{m: map[string]*bridgeSession{}, fp: map[string]*bridgeSession{}}
 
 func (r *bridgeCallRegistry) put(callID string, s *bridgeSession) {
 	if callID == "" || s == nil {
@@ -83,7 +84,43 @@ func (r *bridgeCallRegistry) dropSession(s *bridgeSession) {
 			delete(r.m, id)
 		}
 	}
+	for fp, sess := range r.fp {
+		if sess == s {
+			delete(r.fp, fp)
+		}
+	}
 	r.mu.Unlock()
+}
+
+// putFingerprint 登记「起这条会话的那次请求」的指纹（turn-1 时调）。
+func (r *bridgeCallRegistry) putFingerprint(fp string, s *bridgeSession) {
+	if fp == "" || s == nil {
+		return
+	}
+	r.mu.Lock()
+	r.fp[fp] = s
+	r.mu.Unlock()
+}
+
+func (r *bridgeCallRegistry) getByFingerprint(fp string) *bridgeSession {
+	if fp == "" {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.fp[fp]
+}
+
+// recoverByFingerprint 补上「**不带** tool_result 的原样重发 + 会话键同时漂了」这一格：
+// 这条路径上客户端没回任何 tool_use id，按 id 反查用不上，只剩请求指纹能认人。
+// 认出来就改挂到当前键续跑，否则会照常走 turn-1 再起一条云端 thread（双倍计费 + 老 thread 失联）。
+func (h *Handler) recoverByFingerprint(claudeKey, fp string) *bridgeSession {
+	s := bridgeCallIndex.getByFingerprint(fp)
+	if s == nil || !s.alive() {
+		return nil
+	}
+	h.rebindBridgeSession(s, claudeKey)
+	return s
 }
 
 // —— ② 会话找回 ——
