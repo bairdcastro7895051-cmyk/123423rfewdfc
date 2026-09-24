@@ -189,3 +189,30 @@ func TestBridgeRecoverAcrossKeyDriftKeepsInflight(t *testing.T) {
 		t.Fatal("结果已回，欠账该销掉")
 	}
 }
+
+// 不带 tool_result 的原样重发 + 会话键同时漂了：只剩指纹能认人，认回来才不会再起一条云端 thread。
+func TestRecoverByFingerprintOnDriftedKey(t *testing.T) {
+	h := newBridgeRecoverTestHandler()
+	sess := newBridgeRecoverTestSession(t, h, "claude:k1")
+	defer h.closeBridgeSession(sess)
+	body := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"修 409"}]}]}`)
+	fp := bridgeRequestFingerprint(body)
+	sess.promptFP = fp
+	bridgeCallIndex.putFingerprint(fp, sess)
+
+	if got := h.recoverByFingerprint("claude:k2", fp); got != sess {
+		t.Fatal("指纹没认回漂移后的会话")
+	}
+	if h.lookupBridgeSession("claude:k2") != sess || h.lookupBridgeSession("claude:k1") != nil {
+		t.Fatal("会话没改挂到新键上")
+	}
+	// 换了任务的指纹不该认回任何会话。
+	if got := h.recoverByFingerprint("claude:k3", bridgeRequestFingerprint([]byte(`{"messages":[{"role":"user","content":"换个任务"}]}`))); got != nil {
+		t.Fatal("不同指纹不该命中")
+	}
+	// 会话关掉后指纹索引要一起清，死壳不能被捡回来。
+	h.closeBridgeSession(sess)
+	if got := h.recoverByFingerprint("claude:k4", fp); got != nil {
+		t.Fatal("关闭后指纹索引没清")
+	}
+}
