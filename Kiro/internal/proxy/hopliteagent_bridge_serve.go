@@ -64,6 +64,14 @@ type bridgeSession struct {
 	finalCh   chan bridgeFinal            // thread goroutine 把终态送这里
 	cancel    context.CancelFunc          // 取消会话 ctx（关 thread + pump）
 	closeOnce sync.Once
+
+	// 以下由 hopliteagent_bridge_recover.go（409 找回层）维护，统一走 mu。
+	mu       sync.Mutex
+	closed   bool                    // 已关：与「从没有过」分开，409 文案不同
+	inflight *rendezvous.ToolRequest // 已发出未收回的那次调用，重发时原样再发
+	callIDs  []string                // 本会话发出过的 tool_use id（反查索引的账）
+	fp       string                  // 请求指纹：认「同一个任务」，防重发被当新任务
+	idle     *time.Timer             // 兜底闹钟：单轮超时不杀会话，靠它收一去不返的
 }
 
 type bridgeFinal struct {
@@ -88,15 +96,14 @@ func (h *Handler) lookupBridgeSession(claudeKey string) *bridgeSession {
 
 func (h *Handler) closeBridgeSession(s *bridgeSession) {
 	s.closeOnce.Do(func() {
+		s.markClosed()
 		s.cancel()
 		s.rz.Close()
 		h.bridgeBinder.cancelWaiter(s.bridgeKey)
 		bridgeAttachments.Drop(s.bridgeKey)
-		h.bridgeSessMu.Lock()
-		if h.bridgeSessions[s.claudeKey] == s {
-			delete(h.bridgeSessions, s.claudeKey)
-		}
-		h.bridgeSessMu.Unlock()
+		dropBridgeCalls(s)
+		// 按**值**删：键可能被 rebind 改过，按旧键删会留悬空项。
+		h.dropBridgeSessionEntries(s)
 	})
 }
 
@@ -111,14 +118,15 @@ func (h *Handler) serveHopliteBridgeMessages(c *gin.Context, body []byte, model 
 
 	// 续跑：请求里带 tool_result → 找回会话、投递结果、等下一步。
 	if results := extractBridgeToolResults(body); len(results) > 0 {
-		sess := h.lookupBridgeSession(claudeKey)
+		sess, failMsg := h.resolveBridgeSessionForResults(claudeKey, results)
 		if sess == nil {
-			c.JSON(http.StatusConflict, errorBody("invalid_request_error", "no active bridge session for these tool results (session expired?)"))
+			c.JSON(http.StatusConflict, errorBody("invalid_request_error", failMsg))
 			return
 		}
 		for _, r := range results {
 			sess.rz.SubmitToolResult(r)
 		}
+		sess.settleCalls(results) // 按 CallID 销账：旧结果不会误清新调用
 		h.bridgeNextTurn(c, sess, model, stream)
 		return
 	}
@@ -126,10 +134,10 @@ func (h *Handler) serveHopliteBridgeMessages(c *gin.Context, body []byte, model 
 	// 本轮超时(504)后客户端重发同一条 prompt：会话还活着就接着等，绝不再起第二条云端 thread
 	// （再起一条 = 两个 waiter 抢同一个 MCP 会话 + 双倍计费 + 老 thread 永久失联）。
 	if sess := h.lookupBridgeSession(claudeKey); sess != nil {
-		bridgeAttachments.Put(sess.bridgeKey, hoplitert.ExtractAttachments(body))
-		log.Infof("proxy: /v1/messages provider=hoplite-bridge resume parked session bridgeKey=%s", sess.bridgeKey)
-		h.bridgeNextTurn(c, sess, model, stream)
-		return
+		// 同指纹=原样重发，续跑老会话（还卡在某次调用上就原样重发它）；不同=新任务，关掉老的往下走。
+		if h.resumeExistingBridgeSession(c, sess, body, model, stream) {
+			return
+		}
 	}
 
 	// turn-1：新任务。选 Hoplite 账号（localFs 账号，建 thread 时自动注入强提示逼走 MCP）。
@@ -150,6 +158,7 @@ func (h *Handler) serveHopliteBridgeMessages(c *gin.Context, body []byte, model 
 		toolReqCh: make(chan rendezvous.ToolRequest, 1),
 		finalCh:   make(chan bridgeFinal, 1),
 		cancel:    cancel,
+		fp:        bridgeRequestFingerprint(body),
 	}
 	h.storeBridgeSession(claudeKey, sess)
 
@@ -188,16 +197,10 @@ func (h *Handler) serveHopliteBridgeMessages(c *gin.Context, body []byte, model 
 
 // bridgeNextTurn 等「下一个工具请求」或「thread 完成」，据此回 tool_use 或最终文本。
 func (h *Handler) bridgeNextTurn(c *gin.Context, sess *bridgeSession, model string, stream bool) {
+	h.touchBridgeSession(sess) // 兜底闹钟：本轮超时/断开都不杀会话，只有它和 thread 终态能收
 	select {
 	case tr := <-sess.toolReqCh:
-		tu, err := hoptool.ToClaudeToolUse(hoptool.McpToolCall{Name: tr.ToolName, Arguments: tr.Arguments}, "")
-		if err != nil {
-			// 翻译失败：把错误当结果回给会合（让 Hoplite 知道这步失败），并回客户端错误。
-			sess.rz.SubmitToolResult(rendezvous.ToolResult{CallID: tr.CallID, Content: "tool translate error: " + err.Error(), IsError: true})
-			c.JSON(http.StatusBadGateway, errorBody("api_error", "bridge tool translate failed"))
-			return
-		}
-		h.writeBridgeToolUse(c, model, tr.CallID, tu, stream)
+		h.writeBridgeInflight(c, sess, tr, model, stream)
 	case fin := <-sess.finalCh:
 		h.closeBridgeSession(sess)
 		if fin.err != nil {
@@ -279,6 +282,19 @@ func dedupLastToolResults(in []rendezvous.ToolResult) []rendezvous.ToolResult {
 		}
 	}
 	return out
+}
+
+// writeBridgeInflight 把一次工具调用翻成 tool_use 回客户端，并登记成 inflight（丢了能原样重发）。
+func (h *Handler) writeBridgeInflight(c *gin.Context, sess *bridgeSession, tr rendezvous.ToolRequest, model string, stream bool) {
+	tu, err := hoptool.ToClaudeToolUse(hoptool.McpToolCall{Name: tr.ToolName, Arguments: tr.Arguments}, "")
+	if err != nil {
+		// 翻译失败：把错误当结果回给会合（让 Hoplite 知道这步失败），并回客户端错误。
+		sess.rz.SubmitToolResult(rendezvous.ToolResult{CallID: tr.CallID, Content: "tool translate error: " + err.Error(), IsError: true})
+		c.JSON(http.StatusBadGateway, errorBody("api_error", "bridge tool translate failed"))
+		return
+	}
+	trackBridgeCall(sess, tr)
+	h.writeBridgeToolUse(c, model, tr.CallID, tu, stream)
 }
 
 // writeBridgeToolUse 回一个带 tool_use 块的 Anthropic 响应（stop_reason=tool_use），让 Claude Code 本机执行。
