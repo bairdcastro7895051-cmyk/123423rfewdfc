@@ -126,17 +126,15 @@ func (h *Handler) recoverByFingerprint(claudeKey, fp string) *bridgeSession {
 // —— ② 会话找回 ——
 
 // resolveBridgeSession 给一批 tool_result 找回它们所属的桥会话。
-// 先按会话键查；查不到（或查到的是已被回收的空壳）就按 tool_use id 反查，命中即把会话改挂到
-// 当前会话键上（键漂移后续轮才继续粘得住）。都没有 → (nil, 给客户端看的原因)。
+// **先按 tool_use id 反查，键查在后**：id 是我们自己铸的、全局唯一，它指向的会话一定是这批结果
+// 真正的主人；会话键却会漂，而且漂走之后这个键上可能已经挂了另一条会话——按键投递就把结果投给了
+// 错的会话（真主人继续干等、错收方收到认不出的 CallID 直接丢掉，两边一起等到超时）。
+// 命中即把会话改挂到当前会话键上（键漂移后续轮才继续粘得住）。都没有 → (nil, 给客户端看的原因)。
+//
+// 同一个键上撞着另一条活会话时，rebind 会把它从键表里挤下来：那条会话仍能靠 CallID / 指纹被认回，
+// 最终由兜底闹钟收；这比把结果投错强——投错是必然双边超时。
 func (h *Handler) resolveBridgeSession(claudeKey string, results []rendezvous.ToolResult) (*bridgeSession, string) {
 	deadShell := false
-	if s := h.lookupBridgeSession(claudeKey); s != nil {
-		if s.alive() {
-			return s, ""
-		}
-		deadShell = true
-		h.closeBridgeSession(s) // 空壳先摘掉，免得挡住后面的新任务
-	}
 	for _, r := range results {
 		if s := bridgeCallIndex.get(r.CallID); s != nil {
 			if s.alive() {
@@ -145,6 +143,13 @@ func (h *Handler) resolveBridgeSession(claudeKey string, results []rendezvous.To
 			}
 			deadShell = true
 		}
+	}
+	if s := h.lookupBridgeSession(claudeKey); s != nil {
+		if s.alive() {
+			return s, ""
+		}
+		deadShell = true
+		h.closeBridgeSession(s) // 空壳先摘掉，免得挡住后面的新任务
 	}
 	if deadShell {
 		return nil, "bridge session was closed (idle timeout or upstream thread ended)"

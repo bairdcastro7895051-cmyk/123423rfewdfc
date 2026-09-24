@@ -21,8 +21,11 @@
    `session kept, resend to resume`。配套：无人接手时由 `armIdleClose` 兜底闹钟收
    （`bridgeIdleTTL` = 3×`agentMaxWait`，下限 10 分钟），新一轮请求进来即 `cancelIdleClose`。
 2. **按 `tool_use id` 反查（治 ②）** —— 包级 `bridgeCallIndex` 记「我们发出去的 CallID → 会话」。
-   `resolveBridgeSession` 先按会话键查，查不到或查到死壳就按 id 反查，命中即 `rebindBridgeSession`
-   改挂到当前键上，后续轮继续粘住。
+   `resolveBridgeSession` **先按 id 反查、键查在后**，命中即 `rebindBridgeSession` 改挂到当前键上，
+   后续轮继续粘住。次序是刻意的：CallID 由我们自己铸、全局唯一，指向的一定是这批结果真正的主人；
+   会话键会漂，而漂走后这个键上可能已经挂了**另一条活会话**——按键投递就把结果投给了错的会话
+   （真主人继续干等，错收方认不出 CallID 直接丢掉，两边一起等到超时）。撞键时被挤下键表的那条
+   会话仍能靠 CallID / 指纹认回，最坏由兜底闹钟收，代价远小于投错。
 3. **欠账重发（治 ③）** —— `setInflight` 记住已发未收回的那次调用，客户端再来时
    `bridgeNextTurn` **原样重发同一个 CallID**；`clearInflight` 只在 CallID 对得上时销账，
    旧结果不会误清新调用。
@@ -49,5 +52,6 @@ thread 跑完 / thread 报错 / 同会话换了新任务（指纹不同）/ 无�
 ## 5. 验证状态
 
 - 已跑：隔离 Go 模块（真 `hoptool` / `runtime/hoplite` + `rendezvous`、`Handler` 最小桩），
-  Go 1.25.1：`gofmt -l` 无输出、`go vet ./...` 过、`go test ./...` 全绿，找回层 **8 条单测全 PASS**。
+  Go 1.25.1：`gofmt -l` 无输出、`go vet ./...` 过、`go test ./...` 与 `go test -race ./...` 全绿，
+  找回层 **9 条单测全 PASS**。
 - 没跑：真仓未编译（交付分支只含桥相关文件，无完整 `kiro-proxy` 源码树）；未做端到端真实复现。

@@ -216,3 +216,27 @@ func TestRecoverByFingerprintOnDriftedKey(t *testing.T) {
 		t.Fatal("关闭后指纹索引没清")
 	}
 }
+
+// 会话键漂走之后，同一个键上可能已经挂了另一条活会话。这批结果必须按 CallID 投给真正的主人，
+// 而不是按键投给那条新会话——投错的话真主人继续干等、错收方认不出 CallID 直接丢掉，双边超时。
+func TestResolveBridgeSessionCallIDBeatsKeyCollision(t *testing.T) {
+	h := newBridgeRecoverTestHandler()
+	owner := newBridgeRecoverTestSession(t, h, "claude:owner")
+	defer h.closeBridgeSession(owner)
+	bridgeCallIndex.put("toolu_own", owner)
+
+	// 另一条活会话抢占了客户端这次用的键（键漂移的典型后果）。
+	squatter := newBridgeRecoverTestSession(t, h, "claude:drifted")
+	defer h.closeBridgeSession(squatter)
+
+	got, why := h.resolveBridgeSession("claude:drifted", []rendezvous.ToolResult{{CallID: "toolu_own"}})
+	if got != owner {
+		t.Fatalf("结果被投给了键上那条会话而不是 CallID 的主人: got=%v why=%q", got, why)
+	}
+	if h.lookupBridgeSession("claude:drifted") != owner {
+		t.Fatal("找回后没改挂到当前键")
+	}
+	if !squatter.alive() {
+		t.Fatal("被挤下键表的会话不该被顺手杀掉（它还得靠指纹/CallID 认回）")
+	}
+}
