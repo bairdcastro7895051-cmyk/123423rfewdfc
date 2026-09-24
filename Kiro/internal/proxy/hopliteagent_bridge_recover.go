@@ -20,13 +20,17 @@ package proxy
 // 全部逻辑落在本文件，serve/relay 两个既有文件只留调用点。
 
 import (
+	"context"
 	"fmt"
 	"hash/fnv"
+	"io"
+	"strings"
 	"sync"
 	"time"
 
 	"kiro-proxy/internal/hopbridge/rendezvous"
 
+	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 )
 
@@ -114,8 +118,8 @@ func (r *bridgeCallRegistry) getByFingerprint(fp string) *bridgeSession {
 // recoverByFingerprint 补上「**不带** tool_result 的原样重发 + 会话键同时漂了」这一格：
 // 这条路径上客户端没回任何 tool_use id，按 id 反查用不上，只剩请求指纹能认人。
 // 认出来就改挂到当前键续跑，否则会照常走 turn-1 再起一条云端 thread（双倍计费 + 老 thread 失联）。
-func (h *Handler) recoverByFingerprint(claudeKey, fp string) *bridgeSession {
-	s := bridgeCallIndex.getByFingerprint(fp)
+func (h *Handler) recoverByFingerprint(claudeKey, scopedFP string) *bridgeSession {
+	s := bridgeCallIndex.getByFingerprint(scopedFP)
 	if s == nil || !s.alive() {
 		return nil
 	}
@@ -135,7 +139,10 @@ func (h *Handler) recoverByFingerprint(claudeKey, fp string) *bridgeSession {
 // 最终由兜底闹钟收；这比把结果投错强——投错是必然双边超时。
 func (h *Handler) resolveBridgeSession(claudeKey string, results []rendezvous.ToolResult) (*bridgeSession, string) {
 	deadShell := false
-	for _, r := range results {
+	// 从**最后一条**结果往前找：请求体里带着整段历史的 tool_result，靠前的那些可能属于同一个客户端
+	// 早先的、还没被收掉的另一条会话；末尾那条才是这一轮真正要投递的调用。
+	for i := len(results) - 1; i >= 0; i-- {
+		r := results[i]
 		if s := bridgeCallIndex.get(r.CallID); s != nil {
 			if s.alive() {
 				h.rebindBridgeSession(s, claudeKey)
@@ -252,6 +259,64 @@ func (s *bridgeSession) setClaudeKey(k string) {
 	s.mu.Lock()
 	s.claudeKey = k
 	s.mu.Unlock()
+}
+
+// —— ④ 每条会话同一时刻只允许一轮 HTTP 在等 ——
+//
+// 客户端自己的 HTTP 超时比我们的单轮上限短时，它会在上一轮还挂着的时候就重发。两轮同时守着
+// 同一个 toolReqCh：老那轮（连接已经断了）可能先抢到下一次工具调用，写进一条没人读的响应，
+// 还把 inflight 覆盖成这次调用——上一次调用的结果就此永久欠账，云端 thread 卡死到 TTL，
+// 客户端再重发就是 409。所以新一轮开工时直接抢占老那轮。
+
+// beginTurn 把本轮登记为会话的当前轮并抢占上一轮，返回本轮的 ctx 与收工函数。
+// 抢占只结束老那轮的等待，不动会话本身（会话归新一轮管）。
+func (s *bridgeSession) beginTurn() (context.Context, func()) {
+	s.mu.Lock()
+	if s.turnCancel != nil {
+		s.turnCancel()
+	}
+	s.turnGen++
+	gen := s.turnGen
+	ctx, cancel := context.WithCancel(s.ctx)
+	s.turnCancel = cancel
+	s.mu.Unlock()
+	return ctx, func() {
+		s.mu.Lock()
+		if s.turnGen == gen {
+			s.turnCancel = nil
+		}
+		s.mu.Unlock()
+		cancel()
+	}
+}
+
+// —— 指纹的作用域：同一条 prompt 不能跨客户端凭据认亲 ——
+
+// bridgeFingerprintKey 把请求指纹限定在「同一份客户端凭据」内。
+// 指纹只看消息条数 + 末条 user 文本，两个客户端发同一条 prompt 就会撞上；不加作用域的话
+// recoverByFingerprint 会把 A 的会话交给 B（A 的任务被顶走、B 收到别人的 thread）。
+// 会话键会漂，凭据不会——它正好是这里需要的稳定身份。
+func bridgeFingerprintKey(c *gin.Context, fp string) string {
+	if fp == "" {
+		return ""
+	}
+	return bridgeClientScope(c) + "|" + fp
+}
+
+// bridgeClientScope 取客户端凭据的哈希（只用于分桶，不落日志、不回客户端）。
+func bridgeClientScope(c *gin.Context) string {
+	cred := strings.TrimSpace(c.GetHeader("x-api-key"))
+	if cred == "" {
+		auth := strings.TrimSpace(c.GetHeader("Authorization"))
+		if rest, ok := strings.CutPrefix(auth, "Bearer "); ok {
+			cred = strings.TrimSpace(rest)
+		} else {
+			cred = auth
+		}
+	}
+	hs := fnv.New64a()
+	io.WriteString(hs, cred)
+	return fmt.Sprintf("cred:%016x", hs.Sum64())
 }
 
 // —— 请求指纹：分辨「同一轮重试」与「同一个客户端会话里的新任务」——
