@@ -3,10 +3,14 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"kiro-proxy/internal/hopbridge/rendezvous"
+
+	"github.com/gin-gonic/gin"
 )
 
 // newBridgeRecoverTestSession 造一条挂在 hub 上的桥会话（不起 thread，只要会合槽和登记）。
@@ -238,5 +242,118 @@ func TestResolveBridgeSessionCallIDBeatsKeyCollision(t *testing.T) {
 	}
 	if !squatter.alive() {
 		t.Fatal("被挤下键表的会话不该被顺手杀掉（它还得靠指纹/CallID 认回）")
+	}
+}
+
+// 客户端在上一轮还挂着的时候就重发（它自己的 HTTP 超时更短）：新一轮必须抢占老那轮，
+// 否则两轮同时守着 toolReqCh，老那轮会把下一次调用写进没人读的响应并覆盖 inflight。
+func TestBridgeTurnPreemptsPreviousTurn(t *testing.T) {
+	h := newBridgeRecoverTestHandler()
+	sess := newBridgeRecoverTestSession(t, h, "claude:k")
+	defer h.closeBridgeSession(sess)
+
+	first, endFirst := sess.beginTurn()
+	second, endSecond := sess.beginTurn()
+	select {
+	case <-first.Done():
+	case <-time.After(time.Second):
+		t.Fatal("老那轮没被抢占，会和新一轮抢同一个工具请求")
+	}
+	if second.Err() != nil {
+		t.Fatal("新一轮不该被自己的抢占动作带走")
+	}
+	endFirst() // 老那轮收工不该影响当前轮的登记
+	sess.mu.Lock()
+	cur := sess.turnCancel
+	sess.mu.Unlock()
+	if cur == nil {
+		t.Fatal("老那轮收工把当前轮的登记清掉了")
+	}
+	endSecond()
+	if second.Err() == nil {
+		t.Fatal("收工没结束本轮 ctx")
+	}
+	sess.mu.Lock()
+	cur = sess.turnCancel
+	sess.mu.Unlock()
+	if cur != nil {
+		t.Fatal("当前轮收工后没清登记")
+	}
+}
+
+// 会话被关掉时，正在等的那一轮也要醒（否则要挂到单轮上限才返回）。
+func TestBridgeTurnEndsWhenSessionCloses(t *testing.T) {
+	h := newBridgeRecoverTestHandler()
+	sess := newBridgeRecoverTestSession(t, h, "claude:k")
+	turn, end := sess.beginTurn()
+	defer end()
+	h.closeBridgeSession(sess)
+	select {
+	case <-turn.Done():
+	case <-time.After(time.Second):
+		t.Fatal("会话关了，在等的那一轮没醒")
+	}
+	if sess.alive() {
+		t.Fatal("关掉的会话仍报活着")
+	}
+}
+
+// 指纹只看「消息条数 + 末条 user 文本」，两个客户端发同一条 prompt 必然撞；
+// 认亲必须限定在同一份客户端凭据内，否则 A 的会话会被交给 B。
+func TestBridgeFingerprintScopedToClientCredential(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	mkCtx := func(key string) *gin.Context {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+		c.Request.Header.Set("x-api-key", key)
+		return c
+	}
+	a, b := mkCtx("sk-aaa"), mkCtx("sk-bbb")
+	fp := "fp:deadbeef"
+	if bridgeFingerprintKey(a, fp) == bridgeFingerprintKey(b, fp) {
+		t.Fatal("不同凭据的同一条 prompt 落进了同一个桶")
+	}
+	if bridgeFingerprintKey(a, fp) != bridgeFingerprintKey(mkCtx("sk-aaa"), fp) {
+		t.Fatal("同一份凭据的桶必须稳定，否则键漂之后认不回来")
+	}
+	if bridgeFingerprintKey(a, "") != "" {
+		t.Fatal("空指纹不该参与认亲")
+	}
+	// Authorization: Bearer 与 x-api-key 两种写法都要能取到凭据。
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	c.Request.Header.Set("Authorization", "Bearer sk-aaa")
+	if bridgeFingerprintKey(c, fp) != bridgeFingerprintKey(a, fp) {
+		t.Fatal("Bearer 头没取到与 x-api-key 相同的凭据")
+	}
+
+	h := newBridgeRecoverTestHandler()
+	sess := newBridgeRecoverTestSession(t, h, "claude:owner")
+	defer h.closeBridgeSession(sess)
+	bridgeCallIndex.putFingerprint(bridgeFingerprintKey(a, fp), sess)
+	if got := h.recoverByFingerprint("claude:other", bridgeFingerprintKey(b, fp)); got != nil {
+		t.Fatal("别人的凭据按指纹认走了这条会话")
+	}
+	if got := h.recoverByFingerprint("claude:drifted", bridgeFingerprintKey(a, fp)); got != sess {
+		t.Fatal("同一份凭据键漂之后没认回自己的会话")
+	}
+}
+
+// 请求体里带着整段历史的 tool_result：靠前那些可能属于同一客户端早先那条还活着的会话，
+// 末尾那条才是这一轮真正要投递的调用——认主人必须从最后一条往前找。
+func TestResolveBridgeSessionPrefersNewestResult(t *testing.T) {
+	h := newBridgeRecoverTestHandler()
+	stale := newBridgeRecoverTestSession(t, h, "claude:stale")
+	defer h.closeBridgeSession(stale)
+	current := newBridgeRecoverTestSession(t, h, "claude:current")
+	defer h.closeBridgeSession(current)
+	bridgeCallIndex.put("toolu_old", stale)
+	bridgeCallIndex.put("toolu_new", current)
+
+	got, why := h.resolveBridgeSession("claude:current", []rendezvous.ToolResult{
+		{CallID: "toolu_old"}, {CallID: "toolu_new"},
+	})
+	if got != current {
+		t.Fatalf("按历史里的老 CallID 投给了早先那条会话: got=%v why=%q", got, why)
 	}
 }
