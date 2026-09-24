@@ -72,6 +72,7 @@ type bridgeSession struct {
 	claudeKey string                  // 客户端会话键（可能漂移；靠 tool_use id 找回后改写）
 	inflight  *rendezvous.ToolRequest // 已发给客户端、还没收回结果的那次调用（重发用）
 	promptFP  string                  // turn-1 请求指纹：分辨「同轮重试」与「同会话新任务」
+	reaper    *time.Timer             // 本轮结束后仍无人接手时的兜底回收闹钟
 }
 
 type bridgeFinal struct {
@@ -226,6 +227,7 @@ func bridgeCallIDs(results []rendezvous.ToolResult) string {
 
 // bridgeNextTurn 等「下一个工具请求」或「thread 完成」，据此回 tool_use 或最终文本。
 func (h *Handler) bridgeNextTurn(c *gin.Context, sess *bridgeSession, model string, stream bool) {
+	sess.cancelIdleClose() // 有人接手了，撤掉上一轮留下的兜底闹钟
 	// 上一轮发出去但没收回结果的调用：原样重发同一个 CallID。
 	// 不重发就会在这儿干等「下一个」工具请求——而云端 thread 正卡在那次调用上等结果，两边互等到 TTL。
 	if tr, ok := sess.pendingInflight(); ok {
@@ -244,12 +246,14 @@ func (h *Handler) bridgeNextTurn(c *gin.Context, sess *bridgeSession, model stri
 		}
 		h.writeBridgeFinal(c, model, fin.text, stream)
 	case <-c.Request.Context().Done():
-		// 客户端断开：不杀会话（可能只是这轮超时），交给 reaper/Cleanup 按 idleTTL 收。
+		// 客户端断开：不立刻杀会话（可能只是这轮超时），上兜底闹钟等它重发。
+		sess.armIdleClose(h, h.agentMaxWait())
 		return
 	case <-time.After(h.agentMaxWait()):
 		// 本轮等超时：**只结束这一轮 HTTP**。会话、云端 thread、未收回的调用全留着，
 		// 客户端重发即从原地接着跑；在这儿杀会话正是 409 的头号来源。
 		log.Warnf("proxy: hoplite-bridge turn timeout bridgeKey=%s (session kept)", sess.bridgeKey)
+		sess.armIdleClose(h, h.agentMaxWait())
 		c.JSON(http.StatusGatewayTimeout, errorBody("api_error", "bridge turn timeout (session kept, resend to resume)"))
 	}
 }

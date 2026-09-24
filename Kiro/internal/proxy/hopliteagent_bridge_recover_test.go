@@ -147,3 +147,24 @@ func TestBridgeCallIndexDroppedOnClose(t *testing.T) {
 		t.Fatal("会话关闭后没从表里摘掉")
 	}
 }
+
+// 超时分支不再杀会话，配套的兜底闹钟必须真的会收：到点没人接手 → 会话连同索引一起清掉；
+// 有人接手（新一轮请求）→ 闹钟撤掉，会话留着。
+func TestBridgeIdleCloseArmAndCancel(t *testing.T) {
+	h := newBridgeTestHandler()
+	sess := newBridgeTestSession(t, h, "claude:k")
+	sess.armIdleClose(h, 10*time.Millisecond)
+	time.Sleep(60 * time.Millisecond)
+	if sess.alive() || h.bridgeSessionCount() != 0 {
+		t.Fatal("兜底闹钟没收掉无人接手的会话")
+	}
+
+	sess2 := newBridgeTestSession(t, h, "claude:k2")
+	defer h.closeBridgeSession(sess2)
+	sess2.armIdleClose(h, 10*time.Millisecond)
+	sess2.cancelIdleClose()
+	time.Sleep(60 * time.Millisecond)
+	if !sess2.alive() {
+		t.Fatal("已被接手的会话不该被闹钟收掉")
+	}
+}

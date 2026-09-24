@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"sync"
+	"time"
 
 	"kiro-proxy/internal/hopbridge/rendezvous"
 
@@ -157,6 +158,28 @@ func (s *bridgeSession) noteToolResults(results []rendezvous.ToolResult) {
 	for _, r := range results {
 		s.clearInflight(r.CallID)
 	}
+}
+
+// armIdleClose 给「这一轮 HTTP 已经结束、但会话还留着」的情况上一个兜底闹钟：再过 d 还没有
+// 新一轮请求来接手，就连同云端 thread 一起收掉。超时分支不再杀会话，这个闹钟就是它的配套——
+// 没有它，客户端一去不返的会话会带着 thread / pump 两个 goroutine 常驻。
+func (s *bridgeSession) armIdleClose(h *Handler, d time.Duration) {
+	s.mu.Lock()
+	if s.reaper != nil {
+		s.reaper.Stop()
+	}
+	s.reaper = time.AfterFunc(d, func() { h.closeBridgeSession(s) })
+	s.mu.Unlock()
+}
+
+// cancelIdleClose 有新一轮请求接手时撤掉闹钟。
+func (s *bridgeSession) cancelIdleClose() {
+	s.mu.Lock()
+	if s.reaper != nil {
+		s.reaper.Stop()
+		s.reaper = nil
+	}
+	s.mu.Unlock()
 }
 
 // alive 报告会合槽还在不在（Close / Hub.Cleanup 回收后即 false）。
